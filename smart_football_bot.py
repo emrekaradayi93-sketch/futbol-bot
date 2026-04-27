@@ -1,21 +1,18 @@
 """
 ⚽ Akıllı Maç Filtresi v2 — Telegram Botu
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Sistem:
-  1. Maç başlamadan ~5 dk önce favori oranı < 1.60 → takibe al
-  2. 35. dk'dan itibaren her 4 dk + HT kontrol:
-       • Favori öne geçti → TAKİPTEN ÇIK + bildirim gönder
+  1. Her saatin :50'sinde (07:50-23:50 arası TR saati) → sonraki 60 dk maçları tara
+  2. 07:00-24:00 arası her 5 dk + HT kontrol:
+       • Favori öne geçti → TAKİPTEN ÇIK + bildirim
        • 1 gol fark → favori FT < 2.40  → 🟡
        • 2 gol fark → underdog FT > 1.80 → 🔴
        • 3 gol fark → lider FT > 1.15   → 🔵
-  3. Her fark seviyesinden sadece 1 sinyal.
 """
 
 import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import aiohttp
@@ -34,13 +31,27 @@ ODDS_BASE     = "https://api.the-odds-api.com/v4"
 
 PRE_MATCH_FAV_MAX     = 1.60
 SCAN_FROM_MINUTE      = 35
-SCAN_INTERVAL_MINUTES = 4
+SCAN_INTERVAL_MINUTES = 5
 FAV_1GOAL_MAX         = 2.40
 UNDER_2GOAL_MIN       = 1.80
 LEADER_3GOAL_MIN      = 1.15
 
+# TR saati = UTC+3
+TR_OFFSET    = timedelta(hours=3)
+ACTIVE_START = 7   # 07:00 TR
+ACTIVE_END   = 24  # 24:00 TR
+
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def tr_now() -> datetime:
+    return datetime.now(timezone.utc) + TR_OFFSET
+
+
+def is_active_hours() -> bool:
+    hour = tr_now().hour
+    return ACTIVE_START <= hour < ACTIVE_END
 
 
 @dataclass
@@ -52,20 +63,22 @@ class MatchOdds:
 
 @dataclass
 class TrackedMatch:
-    fixture_id:    int
-    home_team:     str
-    away_team:     str
-    league:        str
-    country:       str
-    favorite:      str
-    pre_fav_odds:  float
-    signaled_diffs: set  = field(default_factory=set)
-    last_checked_minute: int = 0
-    drop_notified: bool  = False
+    fixture_id:          int
+    home_team:           str
+    away_team:           str
+    league:              str
+    country:             str
+    favorite:            str
+    pre_fav_odds:        float
+    signaled_diffs:      set  = field(default_factory=set)
+    last_checked_minute: int  = 0
+    drop_notified:       bool = False
 
 
 tracked: dict = {}
 
+
+# ─── API ──────────────────────────────────────────────────────────────────────
 
 async def get_todays_fixtures() -> list:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -110,7 +123,7 @@ async def get_live_odds(home: str, away: str) -> Optional[MatchOdds]:
                     return None
                 data = await r.json()
     except Exception as e:
-        logger.error(f"Odds API hatası: {e}")
+        logger.error(f"Odds API: {e}")
         return None
 
     hl, al = home.lower(), away.lower()
@@ -126,15 +139,17 @@ async def get_live_odds(home: str, away: str) -> Optional[MatchOdds]:
                 odds = MatchOdds()
                 for o in mkt["outcomes"]:
                     n = o["name"].lower()
-                    if "draw" in n:        odds.draw     = float(o["price"])
+                    if "draw" in n:          odds.draw     = float(o["price"])
                     elif hl in n or n in hl: odds.home_win = float(o["price"])
-                    else:                  odds.away_win = float(o["price"])
+                    else:                    odds.away_win = float(o["price"])
                 if odds.home_win and odds.away_win:
                     return odds
     return None
 
 
-def check_signal(match: TrackedMatch, live_odds: MatchOdds, home_g: int, away_g: int) -> Optional[dict]:
+# ─── Sinyal Mantığı ───────────────────────────────────────────────────────────
+
+def check_signal(match, live_odds, home_g, away_g):
     if match.favorite == "home":
         fav_g, und_g = home_g, away_g
         fav_ft, und_ft = live_odds.home_win, live_odds.away_win
@@ -145,35 +160,48 @@ def check_signal(match: TrackedMatch, live_odds: MatchOdds, home_g: int, away_g:
         fav_name, und_name = match.away_team, match.home_team
 
     diff = und_g - fav_g
+    skor = f"{match.home_team} {home_g}–{away_g} {match.away_team}"
 
     if diff == 1 and 1 not in match.signaled_diffs and 0 < fav_ft < FAV_1GOAL_MAX:
         return {"diff": 1, "emoji": "🟡", "label": "1 GOL GERİDE — Favori Geri Dönebilir",
-                "detail": f"Favori *{fav_name}* 1 gol geride\nCanlı kazanma: *{fav_ft:.2f}* (< {FAV_1GOAL_MAX})\nSkor: {match.home_team} {home_g}–{away_g} {match.away_team}"}
+                "detail": f"Favori *{fav_name}* 1 gol geride\nCanlı kazanma: *{fav_ft:.2f}* (< {FAV_1GOAL_MAX})\nSkor: {skor}"}
 
     if diff == 2 and 2 not in match.signaled_diffs and und_ft > UNDER_2GOAL_MIN:
         return {"diff": 2, "emoji": "🔴", "label": "2 GOL GERİDE — Underdog Tutuyor",
-                "detail": f"Favori *{fav_name}* 2 gol geride\n*{und_name}* oranı: *{und_ft:.2f}* (> {UNDER_2GOAL_MIN})\nSkor: {match.home_team} {home_g}–{away_g} {match.away_team}"}
+                "detail": f"Favori *{fav_name}* 2 gol geride\n*{und_name}* oranı: *{und_ft:.2f}* (> {UNDER_2GOAL_MIN})\nSkor: {skor}"}
 
     if diff == 3 and 3 not in match.signaled_diffs and und_ft > LEADER_3GOAL_MIN:
         return {"diff": 3, "emoji": "🔵", "label": "3 GOL GERİDE — Lider Güçlü",
-                "detail": f"Favori *{fav_name}* 3 gol geride\n*{und_name}* oranı: *{und_ft:.2f}* (> {LEADER_3GOAL_MIN})\nSkor: {match.home_team} {home_g}–{away_g} {match.away_team}"}
+                "detail": f"Favori *{fav_name}* 3 gol geride\n*{und_name}* oranı: *{und_ft:.2f}* (> {LEADER_3GOAL_MIN})\nSkor: {skor}"}
 
     return None
 
 
+# ─── Tarama Görevleri ─────────────────────────────────────────────────────────
+
 async def scan_prematch(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Her saatin :50'sinde çalışır (07:50-23:50 TR arası). Sonraki 60 dk maçları tarar."""
+    now_tr = tr_now()
+    hour   = now_tr.hour
+    minute = now_tr.minute
+
+    # Sadece :50 dakikasında ve aktif saatlerde çalış
+    if not (ACTIVE_START <= hour < ACTIVE_END and 48 <= minute <= 52):
+        return
+
     try:
         fixtures = await get_todays_fixtures()
-        now = datetime.now(timezone.utc)
+        now_utc  = datetime.now(timezone.utc)
+        new_count = 0
+
         for f in fixtures:
             fid = f["fixture"]["id"]
             if f["fixture"]["status"]["short"] != "NS" or fid in tracked:
                 continue
             try:
-                from datetime import datetime as dt
-                kick = dt.fromisoformat(f["fixture"]["date"].replace("Z", "+00:00"))
-                mins = (kick - now).total_seconds() / 60
-                if not (-2 <= mins <= 10):
+                kick = datetime.fromisoformat(f["fixture"]["date"].replace("Z", "+00:00"))
+                mins = (kick - now_utc).total_seconds() / 60
+                if not (0 <= mins <= 70):
                     continue
             except:
                 continue
@@ -198,12 +226,18 @@ async def scan_prematch(context: ContextTypes.DEFAULT_TYPE) -> None:
                 favorite=fav,
                 pre_fav_odds=fav_odds,
             )
+            new_count += 1
             logger.info(f"Takibe: {tracked[fid].home_team} vs {tracked[fid].away_team} | {fav_odds:.2f}")
+
+        logger.info(f"Saatlik tarama ({now_tr.strftime('%H:%M')} TR): {new_count} yeni maç.")
     except Exception as e:
         logger.error(f"scan_prematch: {e}")
 
 
 async def scan_live(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """07:00-24:00 TR arası her 5 dk + HT sinyal kontrolü."""
+    if not is_active_hours():
+        return
     if not tracked:
         return
     subscribers: set = context.bot_data.get("subscribers", set())
@@ -233,13 +267,12 @@ async def scan_live(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             match.last_checked_minute = elapsed
 
-            # Favori & skor durumu
             if match.favorite == "home":
                 fav_g, und_g, fav_name = home_g, away_g, match.home_team
             else:
                 fav_g, und_g, fav_name = away_g, home_g, match.away_team
 
-            # ✅ Favori öne geçti → takipten çıkar + bildirim
+            # Favori öne geçti → takipten çıkar + bildirim
             if fav_g > und_g and not match.drop_notified:
                 match.drop_notified = True
                 tracked.pop(fid, None)
@@ -255,17 +288,14 @@ async def scan_live(context: ContextTypes.DEFAULT_TYPE) -> None:
                     try:
                         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
                     except Exception as e:
-                        logger.warning(f"Drop mesajı: {e}")
+                        logger.warning(f"Drop: {e}")
                 continue
 
-            # Berabere veya favori önde ama zaten bildirildi → atla
             if fav_g >= und_g:
                 continue
 
-            # Canlı oranları çek
             live_odds = await get_live_odds(match.home_team, match.away_team)
             if not live_odds:
-                logger.warning(f"Oran yok: {match.home_team} vs {match.away_team}")
                 continue
 
             signal = check_signal(match, live_odds, home_g, away_g)
@@ -286,19 +316,21 @@ async def scan_live(context: ContextTypes.DEFAULT_TYPE) -> None:
                 try:
                     await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
                 except Exception as e:
-                    logger.warning(f"Sinyal mesajı: {e}")
+                    logger.warning(f"Sinyal: {e}")
 
     except Exception as e:
         logger.error(f"scan_live: {e}")
 
+
+# ─── Komutlar ─────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.bot_data.setdefault("subscribers", set()).add(update.effective_chat.id)
     await update.message.reply_text(
         "⚽ *Akıllı Maç Filtresi v2*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "✅ Maç öncesi favori < *1.60* → takibe alınır\n"
-        "✅ 35. dk'dan her 4 dk + HT kontrol\n\n"
+        "✅ Favori < *1.60* → her saatin :50'sinde taranır (07:50-23:50)\n"
+        "✅ 35. dk'dan her 5 dk + HT kontrol (07:00-24:00)\n\n"
         "🟡 *1 fark* → favori FT < 2.40\n"
         "🔴 *2 fark* → underdog FT > 1.80\n"
         "🔵 *3 fark* → lider FT > 1.15\n"
@@ -326,14 +358,17 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "📖 *Komutlar*\n\n/start /status /stop /help",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text("📖 *Komutlar*\n\n/start /status /stop /help", parse_mode="Markdown")
 
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    for key, name in [(TELEGRAM_TOKEN,"TELEGRAM_TOKEN"),(FOOTBALL_API_KEY,"FOOTBALL_API_KEY"),(ODDS_API_KEY,"ODDS_API_KEY")]:
+    for key, name in [
+        (TELEGRAM_TOKEN, "TELEGRAM_TOKEN"),
+        (FOOTBALL_API_KEY, "FOOTBALL_API_KEY"),
+        (ODDS_API_KEY, "ODDS_API_KEY"),
+    ]:
         if not key:
             raise ValueError(f"{name} .env dosyasında bulunamadı!")
 
@@ -342,8 +377,11 @@ async def main() -> None:
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("stop",   stop_command))
     app.add_handler(CommandHandler("help",   help_command))
-    app.job_queue.run_repeating(scan_prematch, interval=120, first=10)
-    app.job_queue.run_repeating(scan_live,     interval=240, first=30)
+
+    # Her 5 dk'da bir çalışır ama içeride saat kontrolü yapar
+    app.job_queue.run_repeating(scan_prematch, interval=300, first=10)
+    # Her 5 dk canlı tarama
+    app.job_queue.run_repeating(scan_live, interval=300, first=60)
 
     logger.info("⚽ Akıllı Maç Filtresi v2 başlatıldı!")
     async with app:
