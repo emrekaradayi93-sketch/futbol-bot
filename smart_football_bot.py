@@ -1,6 +1,6 @@
 """
-⚽ Akıllı Maç Filtresi v2 — Telegram Botu
-  1. Saatte 1 kez (07:00-24:00 TR) → sonraki 60 dk maçları tara, favori < 1.60 → takibe al
+⚽ Akıllı Maç Filtresi v3 — Telegram Botu
+  1. Saatte 1 kez (07:00-24:00 TR) → bugünkü tüm maçları tara, favori < 1.60 → takibe al
   2. 35. dk'dan itibaren her 5 dk + HT kontrol:
        • Favori öne geçti → TAKİPTEN ÇIK + bildirim
        • 1 gol fark → favori FT < 2.40  → 🟡
@@ -43,11 +43,11 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
 logger = logging.getLogger(__name__)
 
 
-def tr_now() -> datetime:
+def tr_now():
     return datetime.now(timezone.utc) + TR_OFFSET
 
 
-def is_active_hours() -> bool:
+def is_active_hours():
     return ACTIVE_START <= tr_now().hour < ACTIVE_END
 
 
@@ -75,7 +75,15 @@ class TrackedMatch:
 tracked: dict = {}
 
 
-async def get_todays_fixtures() -> list:
+async def get_todays_odds():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    headers = {"x-apisports-key": FOOTBALL_API_KEY}
+    async with aiohttp.ClientSession() as s:
+        async with s.get(f"{FOOTBALL_BASE}/odds?date={today}", headers=headers) as r:
+            return (await r.json()).get("response", [])
+
+
+async def get_todays_fixtures():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     headers = {"x-apisports-key": FOOTBALL_API_KEY}
     async with aiohttp.ClientSession() as s:
@@ -83,33 +91,37 @@ async def get_todays_fixtures() -> list:
             return (await r.json()).get("response", [])
 
 
-async def get_live_fixtures() -> list:
+async def get_live_fixtures():
     headers = {"x-apisports-key": FOOTBALL_API_KEY}
     async with aiohttp.ClientSession() as s:
         async with s.get(f"{FOOTBALL_BASE}/fixtures?live=all", headers=headers) as r:
             return (await r.json()).get("response", [])
 
 
-async def get_prematch_odds(fixture_id: int) -> Optional[MatchOdds]:
+async def get_live_odds_football_api(fixture_id):
     headers = {"x-apisports-key": FOOTBALL_API_KEY}
     async with aiohttp.ClientSession() as s:
-        async with s.get(f"{FOOTBALL_BASE}/odds?fixture={fixture_id}&bet=1", headers=headers) as r:
+        async with s.get(f"{FOOTBALL_BASE}/odds/live?fixture={fixture_id}", headers=headers) as r:
             resp = (await r.json()).get("response", [])
             if not resp:
                 return None
             try:
-                values = resp[0]["bookmakers"][0]["bets"][0]["values"]
-                odds = MatchOdds()
-                for v in values:
-                    if v["value"] == "Home":   odds.home_win = float(v["odd"])
-                    elif v["value"] == "Draw": odds.draw     = float(v["odd"])
-                    elif v["value"] == "Away": odds.away_win = float(v["odd"])
-                return odds
+                for bm in resp[0].get("bookmakers", []):
+                    for bet in bm.get("bets", []):
+                        if bet["id"] == 1:
+                            odds = MatchOdds()
+                            for v in bet["values"]:
+                                if v["value"] == "Home":   odds.home_win = float(v["odd"])
+                                elif v["value"] == "Draw": odds.draw     = float(v["odd"])
+                                elif v["value"] == "Away": odds.away_win = float(v["odd"])
+                            if odds.home_win and odds.away_win:
+                                return odds
             except:
                 return None
+    return None
 
 
-async def get_live_odds(home: str, away: str) -> Optional[MatchOdds]:
+async def get_live_odds_the_odds_api(home, away):
     params = {"apiKey": ODDS_API_KEY, "regions": "eu", "markets": "h2h", "oddsFormat": "decimal"}
     try:
         async with aiohttp.ClientSession() as s:
@@ -137,6 +149,20 @@ async def get_live_odds(home: str, away: str) -> Optional[MatchOdds]:
                     if "draw" in n:          odds.draw     = float(o["price"])
                     elif hl in n or n in hl: odds.home_win = float(o["price"])
                     else:                    odds.away_win = float(o["price"])
+                if odds.home_win and odds.away_win:
+                    return odds
+    return None
+
+
+def extract_prematch_odds(bookmakers):
+    for bm in bookmakers:
+        for bet in bm.get("bets", []):
+            if bet.get("id") == 1 or bet.get("name") == "Match Winner":
+                odds = MatchOdds()
+                for v in bet.get("values", []):
+                    if v["value"] == "Home":   odds.home_win = float(v["odd"])
+                    elif v["value"] == "Draw": odds.draw     = float(v["odd"])
+                    elif v["value"] == "Away": odds.away_win = float(v["odd"])
                 if odds.home_win and odds.away_win:
                     return odds
     return None
@@ -171,27 +197,39 @@ def check_signal(match, live_odds, home_g, away_g):
 
 
 async def scan_prematch(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Saatte 1 kez çalışır (07:00-24:00 TR). Sonraki 60 dk maçları tarar."""
+    """Saatte 1 kez. Bugünkü tüm başlamamış maçları tarar."""
     if not is_active_hours():
         return
     try:
-        fixtures = await get_todays_fixtures()
-        now_utc  = datetime.now(timezone.utc)
+        odds_list = await get_todays_odds()
+        fixtures  = await get_todays_fixtures()
+        now_utc   = datetime.now(timezone.utc)
+        fix_map   = {f["fixture"]["id"]: f for f in fixtures}
         new_count = 0
 
-        for f in fixtures:
-            fid = f["fixture"]["id"]
-            if f["fixture"]["status"]["short"] != "NS" or fid in tracked:
+        for item in odds_list:
+            fid = item["fixture"]["id"]
+            if fid in tracked:
                 continue
+
+            fix = fix_map.get(fid)
+            if not fix:
+                continue
+
+            # Sadece başlamamış maçlar
+            if fix["fixture"]["status"]["short"] != "NS":
+                continue
+
+            # Geçmişte kalmış maçları atla (10 dk tolerans)
             try:
-                kick = datetime.fromisoformat(f["fixture"]["date"].replace("Z", "+00:00"))
-                mins = (kick - now_utc).total_seconds() / 60
-                if not (0 <= mins <= 70):
+                kick = datetime.fromisoformat(fix["fixture"]["date"].replace("Z", "+00:00"))
+                if (kick - now_utc).total_seconds() < -600:
                     continue
             except:
                 continue
 
-            odds = await get_prematch_odds(fid)
+            # Oranları çek
+            odds = extract_prematch_odds(item.get("bookmakers", []))
             if not odds or not odds.home_win or not odds.away_win:
                 continue
 
@@ -204,10 +242,10 @@ async def scan_prematch(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             tracked[fid] = TrackedMatch(
                 fixture_id=fid,
-                home_team=f["teams"]["home"]["name"],
-                away_team=f["teams"]["away"]["name"],
-                league=f["league"]["name"],
-                country=f["league"]["country"],
+                home_team=fix["teams"]["home"]["name"],
+                away_team=fix["teams"]["away"]["name"],
+                league=fix["league"]["name"],
+                country=fix["league"]["country"],
                 favorite=fav,
                 pre_fav_odds=fav_odds,
             )
@@ -220,10 +258,7 @@ async def scan_prematch(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def scan_live(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """07:00-24:00 TR arası her 5 dk + HT sinyal kontrolü."""
-    if not is_active_hours():
-        return
-    if not tracked:
+    if not is_active_hours() or not tracked:
         return
     subscribers: set = context.bot_data.get("subscribers", set())
     if not subscribers:
@@ -257,7 +292,6 @@ async def scan_live(context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 fav_g, und_g, fav_name = away_g, home_g, match.away_team
 
-            # Favori öne geçti → takipten çıkar + bildirim
             if fav_g > und_g and not match.drop_notified:
                 match.drop_notified = True
                 tracked.pop(fid, None)
@@ -279,7 +313,9 @@ async def scan_live(context: ContextTypes.DEFAULT_TYPE) -> None:
             if fav_g >= und_g:
                 continue
 
-            live_odds = await get_live_odds(match.home_team, match.away_team)
+            live_odds = await get_live_odds_football_api(fid)
+            if not live_odds:
+                live_odds = await get_live_odds_the_odds_api(match.home_team, match.away_team)
             if not live_odds:
                 continue
 
@@ -310,9 +346,10 @@ async def scan_live(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.bot_data.setdefault("subscribers", set()).add(update.effective_chat.id)
     await update.message.reply_text(
-        "⚽ *Akıllı Maç Filtresi v2*\n"
+        "⚽ *Akıllı Maç Filtresi v3*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "✅ Favori < *1.60* → saatte 1 kez taranır (07:00-24:00 TR)\n"
+        "✅ Bugünkü tüm maçlar dahil\n"
         "✅ 35. dk'dan her 5 dk + HT kontrol\n\n"
         "🟡 *1 fark* → favori FT < 2.40\n"
         "🔴 *2 fark* → underdog FT > 1.80\n"
@@ -359,12 +396,10 @@ async def main() -> None:
     app.add_handler(CommandHandler("stop",   stop_command))
     app.add_handler(CommandHandler("help",   help_command))
 
-    # Saatte 1 kez prematch tarama
     app.job_queue.run_repeating(scan_prematch, interval=3600, first=10)
-    # Her 5 dk canlı tarama
-    app.job_queue.run_repeating(scan_live, interval=300, first=60)
+    app.job_queue.run_repeating(scan_live,     interval=300,  first=60)
 
-    logger.info("⚽ Akıllı Maç Filtresi v2 başlatıldı!")
+    logger.info("⚽ Akıllı Maç Filtresi v3 başlatıldı!")
     async with app:
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
